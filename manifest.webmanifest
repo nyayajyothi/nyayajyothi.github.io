@@ -1,0 +1,28 @@
+{
+ "name": "Nyaya Jyothi \u2013 Legal Help",
+ "short_name": "Nyaya Jyothi",
+ "start_url": "./",
+ "scope": "./",
+ "display": "standalone",
+ "background_color": "#fff8ec",
+ "theme_color": "#b8430a",
+ "description": "Simple legal help in English, Tamil and Hindi by A. Neeraj, Advocate, High Court of Madras.",
+ "icons": [
+  {
+   "src": "icon-192.png",
+   "sizes": "192x192",
+   "type": "image/png"
+  },
+  {
+   "src": "icon-512.png",
+   "sizes": "512x512",
+   "type": "image/png"
+  },
+  {
+   "src": "icon-512-maskable.png",
+   "sizes": "512x512",
+   "type": "image/png",
+   "purpose": "maskable"
+  }
+ ]
+}
