@@ -3,7 +3,7 @@
 const CONFIG={
  API:"",
  PHONE:"80158 23352", PHONE_WA:"918015823352", EMAIL:"adv.neeraj.legal@gmail.com",
- ADDRESS:"1st Floor, Beach Line Road, Chennai",
+ ADDRESS:"No. 38, 1st Floor, Second Line Beach, Parrys, Chennai – 600 001",
  SHARE_URL:"https://nyayajyothi.github.io/",   /* the link that the Share button sends */
  SPLASH_MS:0, PHOTOS:[]
 };

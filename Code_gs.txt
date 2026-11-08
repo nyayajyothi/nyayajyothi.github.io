@@ -1,0 +1,399 @@
+/**
+ * NJ LEGAL SOLUTIONS – server (Google Apps Script + Google Sheet + Google Drive)
+ * Members sign up with mobile number + 4-digit PIN (free). Keeps members, profiles, activity, enquiries,
+ * case diaries and uploaded documents, and gives the private Advocate dashboard.
+ *
+ * YOU MUST CHANGE: ADMIN_PASSWORD. For NJ AI on the website: AI_KEY.
+ */
+const ADMIN_PASSWORD = 'CHANGE-THIS-PASSWORD';
+const NOTIFY_EMAIL   = 'adv.neeraj.legal@gmail.com';  // email alert for every new enquiry ('' = off)
+const UPLOAD_FOLDER  = 'Nyaya Jyothi – Client Documents'; // folder in your Google Drive (private to you)
+
+/* Optional WhatsApp hearing reminders (Meta WhatsApp Business API) – leave blank if not used */
+const WA_TOKEN    = '';
+const WA_PHONE_ID = '';
+const WA_LANG     = 'en';
+const WA_REMIND_TEMPLATE = ''; // optional approved UTILITY template for hearing reminders, with 3 body values: name, case number, stage
+
+/* NJ AI – answers come from Anthropic's Claude API. Create a key at console.anthropic.com and paste it here. */
+const AI_KEY   = '';                    // e.g. 'sk-ant-...'
+const AI_MODEL = 'claude-sonnet-5-5';   // or 'claude-haiku-5-5' for lower cost
+const AI_DAILY_LIMIT = 30;              // questions per member per day
+
+/* ------------------------------------------------------------------------------------- */
+const SH = {
+  members:   ['Joined', 'MemberID', 'Name', 'Phone', 'District', 'Language', 'Verified', 'Token', 'LastSeen', 'LastSeenMs', 'Visits', 'Logins', 'Email', 'Type', 'State', 'Enrolment', 'Court', 'PinHash', 'Salt', 'Fails', 'LockUntil', 'DobHash', 'DobSalt'],
+  cases:     ['CaseID', 'MemberID', 'Phone', 'CaseNo', 'Court', 'NextDate', 'Stage', 'Data', 'Updated'],
+  ai:        ['Time', 'Phone', 'Name', 'Question', 'Photos', 'AnswerChars'],
+  settings:  ['Key', 'Value', 'Updated'],
+  enquiries: ['Time', 'Ref', 'MemberID', 'Name', 'Phone', 'Area', 'Problem', 'Details', 'BestTime', 'Status', 'NoteToClient', 'Files', 'Updated'],
+  logins:    ['Time', 'Phone', 'Name', 'Method'],
+  activity:  ['Time', 'TimeMs', 'Phone', 'Name', 'Type', 'Detail']
+};
+const PHONE_COL = { settings: 'Z:Z', members: 'D:D', enquiries: 'E:E', logins: 'B:B', activity: 'C:C', cases: 'C:C', ai: 'B:B' };
+
+function sheet_(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(SH[name]);
+    sh.getRange(1, 1, 1, SH[name].length).setFontWeight('bold').setBackground('#f6e7c8');
+    sh.setFrozenRows(1);
+    sh.getRange(PHONE_COL[name]).setNumberFormat('@');
+  }
+  return sh;
+}
+function rows_(name) {
+  const v = sheet_(name).getDataRange().getValues(), head = v.shift();
+  return v.map((r, i) => { const o = { _row: i + 2 }; head.forEach((h, j) => o[h] = r[j]); return o; });
+}
+function setCells_(name, row, obj) {
+  const sh = sheet_(name), head = SH[name];
+  Object.keys(obj).forEach(k => { const c = head.indexOf(k); if (c >= 0) sh.getRange(row, c + 1).setValue(obj[k]); });
+}
+function append_(name, obj) { sheet_(name).appendRow(SH[name].map(h => obj[h] === undefined ? '' : obj[h])); }
+const now_ = () => Utilities.formatDate(new Date(), 'Asia/Kolkata', 'dd.MM.yyyy HH:mm');
+const phone_ = p => String(p || '').replace(/\D/g, '').slice(-10);
+const fail_ = (error, code) => ({ ok: false, error, code: code || '' });
+
+/* ---------- Entry points ---------- */
+function doGet() { return ContentService.createTextOutput('Nyaya Jyothi server is running.'); }
+function doPost(e) {
+  let out;
+  try { out = api(JSON.parse(e.postData.contents)); } catch (err) { out = fail_('Server error: ' + err.message); }
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+function api(req) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(25000);
+  try {
+    switch (req.action) {
+      case 'config':    return { ok: true };
+      case 'settings':  return { ok: true, settings: settings_() };
+      case 'saveSettings': return saveSettings_(req);
+      case 'signup':    return signup_(req);
+      case 'login':     return signin_(req);
+      case 'resetPin':  return resetPin_(req);
+      case 'forgotPin': return forgotPin_(req);
+      case 'changePin': return changePin_(req);
+      case 'member':    return memberDetail_(req);
+      case 'ping':      return ping_(req);
+      case 'track':     return track_(req);
+      case 'profile':   return profile_(req);
+      case 'cases':     return cases_(req);
+      case 'saveCase':  return saveCase_(req);
+      case 'deleteCase':return deleteCase_(req);
+      case 'ai':        lock.releaseLock(); return ai_(req);
+      case 'enquiry':   return enquiry_(req);
+      case 'addFiles':  return addFiles_(req);
+      case 'my':        return my_(req);
+      case 'admin':     return admin_(req);
+      case 'setStatus': return setStatus_(req);
+      default:          return fail_('Unknown action');
+    }
+  } finally { try { lock.releaseLock(); } catch (e) {} }
+}
+
+/* ---------- Accounts: mobile number + 4-digit PIN (free, no OTP) ---------- */
+const hash_ = (pin, salt) => Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, salt + ':' + pin));
+const clip_ = (x, n) => String(x || '').trim().slice(0, n || 80);
+function signup_(r) {
+  const phone = phone_(r.phone), p = r.profile || {}, name = clip_(p.name);
+  if (!/^[6-9]\d{9}$/.test(phone)) return fail_('Please enter a valid 10-digit mobile number.');
+  if (!name) return fail_('Please enter your name.');
+  if (!/^\d{4}$/.test(String(r.pin))) return fail_('PIN must be 4 digits.');
+  if (rows_('members').some(x => phone_(x.Phone) === phone)) return fail_('This mobile number already has an account. Please login.');
+  const dob = String(r.dob || '').trim(); if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) return fail_('Please enter your date of birth.');
+  const salt = Utilities.getUuid(), dsalt = Utilities.getUuid();
+  append_('members', { Joined: now_(), MemberID: 'M' + Date.now().toString(36).toUpperCase(), Name: name, Phone: phone, District: clip_(p.district),
+    Language: r.lang || 'en', Verified: 'Yes', Visits: 0, Logins: 0, Email: clip_(p.email), Type: clip_(p.type), State: clip_(p.state),
+    Enrolment: clip_(p.enrol), Court: clip_(p.court), PinHash: hash_(r.pin, salt), Salt: salt, Fails: 0, LockUntil: 0, DobHash: hash_('dob:' + dob, dsalt), DobSalt: dsalt });
+  return login_(phone, 'Sign up');
+}
+function signin_(r) {
+  const phone = phone_(r.phone), m = rows_('members').find(x => phone_(x.Phone) === phone);
+  if (!/^[6-9]\d{9}$/.test(phone)) return fail_('Please enter a valid 10-digit mobile number.');
+  if (!m) return fail_('No account found for this mobile number. Please check the number or create a new account.');
+  if (Number(m.LockUntil) > Date.now()) return fail_('Too many wrong PINs. Please try after 15 minutes, or ask the office to reset your PIN.');
+  if (hash_(r.pin, m.Salt) !== m.PinHash) {
+    const f = Number(m.Fails || 0) + 1;
+    setCells_('members', m._row, { Fails: f >= 5 ? 0 : f, LockUntil: f >= 5 ? Date.now() + 15 * 60000 : 0 });
+    return fail_(f >= 5 ? 'Wrong PIN entered 5 times. Please try after 15 minutes, or use Forgot PIN.' : 'Wrong PIN. Please enter the correct PIN.');
+  }
+  setCells_('members', m._row, { Fails: 0, LockUntil: 0 });
+  return login_(phone, 'PIN');
+}
+function login_(phone, method) {
+  const m = rows_('members').find(x => phone_(x.Phone) === phone);
+  const token = Utilities.getUuid() + Utilities.getUuid().slice(0, 8);
+  setCells_('members', m._row, { Token: token, LastSeen: now_(), LastSeenMs: Date.now(), Logins: Number(m.Logins || 0) + 1, Visits: Number(m.Visits || 0) + 1 });
+  append_('logins', { Time: now_(), Phone: phone, Name: m.Name, Method: method });
+  append_('activity', { Time: now_(), TimeMs: Date.now(), Phone: phone, Name: m.Name, Type: method === 'Sign up' ? 'signup' : 'login', Detail: (m.Type || '') + (m.District ? ' · ' + m.District : '') });
+  return { ok: true, token, name: m.Name, phone, profile: profileOf_(rows_('members').find(x => phone_(x.Phone) === phone)) };
+}
+function profileOf_(m) { return { name: m.Name, email: m.Email || '', type: m.Type || '', state: m.State || '', district: m.District || '', enrol: m.Enrolment || '', court: m.Court || '' }; }
+function member_(t) { return t ? rows_('members').find(m => m.Token && m.Token === t) : null; }
+function ping_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  setCells_('members', m._row, { LastSeen: now_(), LastSeenMs: Date.now(), Visits: Number(m.Visits || 0) + 1, Language: r.lang || m.Language });
+  return { ok: true, profile: profileOf_(m) };
+}
+
+/* ---------- Activity: searches and screens opened (shown in the dashboard) ---------- */
+function track_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  const sh = sheet_('activity'), ev = (r.events || []).slice(0, 40);
+  if (!ev.length) return { ok: true };
+  const rows = ev.map(e => [Utilities.formatDate(new Date(Number(e.at) || Date.now()), 'Asia/Kolkata', 'dd.MM.yyyy HH:mm'), Number(e.at) || Date.now(),
+    phone_(m.Phone), m.Name, String(e.type || '').slice(0, 30), String(e.detail || '').slice(0, 200)]);
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  return { ok: true };
+}
+function activity_() {
+  const sh = sheet_('activity'), n = sh.getLastRow() - 1;
+  if (n < 1) return { recent: [], topSearch: [], topOpen: [] };
+  const take = Math.min(n, 5000), v = sh.getRange(sh.getLastRow() - take + 1, 1, take, 6).getValues();
+  const since = Date.now() - 30 * 864e5, cs = {}, co = {};
+  v.forEach(r => { if (Number(r[1]) < since) return;
+    if (r[4] === 'search') { const k = String(r[5]).toLowerCase(); cs[k] = (cs[k] || 0) + 1; }
+    if (r[4] === 'open_problem') { co[r[5]] = (co[r[5]] || 0) + 1; } });
+  const top = o => Object.keys(o).map(k => [k, o[k]]).sort((a, b) => b[1] - a[1]).slice(0, 15);
+  const recent = v.slice(-300).reverse().map(r => ({ time: String(r[0]), phone: phone_(r[2]), name: r[3], type: r[4], detail: r[5] }));
+  return { recent, topSearch: top(cs), topOpen: top(co) };
+}
+
+/* ---------- Profile ---------- */
+function profile_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  const p = r.profile || {}, s = x => String(x || '').slice(0, 80);
+  const upd = { Name: s(p.name) || m.Name, Email: s(p.email), Type: s(p.type), Enrolment: s(p.enrol), Court: s(p.court) };
+  if (p.state !== undefined) upd.State = s(p.state); if (p.district !== undefined) upd.District = s(p.district);
+  if (r.pin) { if (!/^\d{4}$/.test(String(r.pin))) return fail_('PIN must be 4 digits.'); upd.Salt = Utilities.getUuid(); upd.PinHash = hash_(r.pin, upd.Salt); }
+  setCells_('members', m._row, upd);
+  append_('activity', { Time: now_(), TimeMs: Date.now(), Phone: phone_(m.Phone), Name: upd.Name, Type: 'profile', Detail: [upd.Type, upd.District, upd.State, upd.Enrolment, upd.Court].filter(String).join(' · ') });
+  return { ok: true };
+}
+
+/* ---------- Case Diary ---------- */
+function cases_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  const items = rows_('cases').filter(c => c.MemberID === m.MemberID).map(c => { try { return JSON.parse(c.Data); } catch (e) { return null; } }).filter(Boolean);
+  return { ok: true, items };
+}
+function saveCase_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  const c = r.item || {}; if (!c.id) return fail_('No case.');
+  const rec = { CaseID: String(c.id), MemberID: m.MemberID, Phone: phone_(m.Phone), CaseNo: String(c.no || '').slice(0, 80), Court: String(c.court || '').slice(0, 120),
+    NextDate: String(c.next || ''), Stage: String(c.stage || '').slice(0, 80), Data: JSON.stringify(c).slice(0, 45000), Updated: now_() };
+  const ex = rows_('cases').find(x => x.CaseID === rec.CaseID && x.MemberID === m.MemberID);
+  if (ex) setCells_('cases', ex._row, rec); else append_('cases', rec);
+  return { ok: true };
+}
+function deleteCase_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  const ex = rows_('cases').find(x => x.CaseID === String(r.id) && x.MemberID === m.MemberID);
+  if (ex) sheet_('cases').deleteRow(ex._row);
+  return { ok: true };
+}
+
+/* ---------- Daily hearing reminders (7 am): e-mail, and WhatsApp if a template is set ---------- */
+function dailyReminders() {
+  const today = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'yyyy-MM-dd');
+  const ms = rows_('members'), byMember = {};
+  rows_('cases').filter(c => String(c.NextDate) === today).forEach(c => (byMember[c.MemberID] = byMember[c.MemberID] || []).push(c));
+  Object.keys(byMember).forEach(id => {
+    const m = ms.find(x => x.MemberID === id); if (!m) return;
+    const list = byMember[id], text = list.map(c => '• ' + c.CaseNo + ' – ' + c.Court + ' – ' + (c.Stage || 'hearing')).join('\n');
+    if (m.Email) { try { MailApp.sendEmail(m.Email, 'NJ Legal Solutions – ' + list.length + ' hearing(s) today', 'Vanakkam ' + m.Name + ',\n\nToday you have:\n' + text + '\n\nOpen the NJ app → Diary for the Hearing Guide.\n\nNJ Legal Solutions'); } catch (e) { console.error(e); } }
+    if (WA_TOKEN && WA_PHONE_ID && WA_REMIND_TEMPLATE) list.forEach(c => {
+      UrlFetchApp.fetch('https://graph.facebook.com/v21.0/' + WA_PHONE_ID + '/messages', { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+        headers: { Authorization: 'Bearer ' + WA_TOKEN }, payload: JSON.stringify({ messaging_product: 'whatsapp', to: '91' + phone_(m.Phone), type: 'template',
+          template: { name: WA_REMIND_TEMPLATE, language: { code: WA_LANG }, components: [{ type: 'body', parameters: [{ type: 'text', text: String(m.Name) }, { type: 'text', text: String(c.CaseNo) }, { type: 'text', text: String(c.Stage || 'hearing') }] }] } }) });
+    });
+  });
+}
+
+/* ---------- NJ AI ---------- */
+const AI_SYSTEM = [
+ 'You are NJ AI, the legal information assistant inside the NJ Legal Solutions app (M/s. Neeraj & Associates, Chennai).',
+ 'Answer questions about Indian law clearly and practically, in the same language as the user (English, Tamil or Hindi). Use simple words for citizens and precise procedure for advocates.',
+ 'Use the current criminal laws in force from 1 July 2024: Bharatiya Nyaya Sanhita (BNS), Bharatiya Nagarik Suraksha Sanhita (BNSS) and Bharatiya Sakshya Adhiniyam (BSA); mention the old IPC / CrPC / Evidence Act section in brackets when helpful. Give Tamil Nadu and Madras High Court practice where relevant.',
+ 'Structure answers with short headings and numbered steps: what it means, what to do now, what to file, time limits, and the sections of law. Cite sections only when you are confident; say when something must be checked.',
+ 'When given photos of eCourts case status / case history, cause lists or court papers: read the case number, court, stage, purpose and past dates, notice repeated adjournments, and explain exactly what the advocate should do at today\'s hearing – what to file, what to argue, and if not ready, how to seek time properly (adjournment petition, costs, limits) – plus what to tell the client.',
+ 'Never invent judgments or citations. Do not advertise any advocate. If the user needs representation, say they may contact the office through the app. End with one short line: "General information only – please verify before acting."'
+].join('\n');
+function ai_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in to use NJ AI.', 'auth');
+  if (!AI_KEY) return fail_('NJ AI is being set up and will be available soon.');
+  const today = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'dd.MM.yyyy');
+  const used = rows_('ai').filter(x => phone_(x.Phone) === phone_(m.Phone) && String(x.Time).indexOf(today) === 0).length;
+  if (used >= AI_DAILY_LIMIT) return fail_('You have reached today\'s limit for NJ AI. Please try again tomorrow.');
+  const hist = (r.messages || []).slice(-10).filter(x => x && x.text && x.text !== '…').map(x => ({ role: x.role === 'assistant' ? 'assistant' : 'user', content: String(x.text).slice(0, 6000) }));
+  while (hist.length && hist[0].role !== 'user') hist.shift();
+  if (!hist.length) return fail_('Please type a question.');
+  const last = hist[hist.length - 1];
+  const imgs = (r.files || []).slice(0, 6).filter(f => /^image\/(jpeg|png|webp)$/.test(f.type));
+  if (imgs.length) last.content = imgs.map(f => ({ type: 'image', source: { type: 'base64', media_type: f.type, data: f.data } })).concat([{ type: 'text', text: last.content }]);
+  const res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+    headers: { 'x-api-key': AI_KEY, 'anthropic-version': '2023-06-01' },
+    payload: JSON.stringify({ model: AI_MODEL, max_tokens: 2000, system: AI_SYSTEM + '\nUser language code: ' + (r.lang || 'en') + '. Today is ' + today + '.', messages: hist }) });
+  if (res.getResponseCode() >= 300) { console.error(res.getContentText()); return fail_('NJ AI is busy right now. Please try again in a minute.'); }
+  const out = JSON.parse(res.getContentText()), answer = (out.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try { append_('ai', { Time: now_(), Phone: phone_(m.Phone), Name: m.Name, Question: (typeof last.content === 'string' ? last.content : r.messages[r.messages.length - 1].text).slice(0, 500), Photos: imgs.length, AnswerChars: answer.length });
+    append_('activity', { Time: now_(), TimeMs: Date.now(), Phone: phone_(m.Phone), Name: m.Name, Type: 'ai_question', Detail: String(r.messages[r.messages.length - 1].text).slice(0, 200) }); } finally { lock.releaseLock(); }
+  return { ok: true, answer };
+}
+
+/* ---------- Documents (saved privately in your Google Drive) ---------- */
+function folder_(ref) {
+  const it = DriveApp.getFoldersByName(UPLOAD_FOLDER);
+  const root = it.hasNext() ? it.next() : DriveApp.createFolder(UPLOAD_FOLDER);
+  const sub = root.getFoldersByName(ref);
+  return sub.hasNext() ? sub.next() : root.createFolder(ref);
+}
+function saveFiles_(ref, files) {
+  if (!files || !files.length) return [];
+  const f = folder_(ref), links = [];
+  files.slice(0, 8).forEach((x, i) => {
+    const okType = /^(image\/(jpeg|png|webp|heic)|application\/pdf|application\/msword|application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document)$/.test(x.type || '');
+    if (!okType) return;
+    const blob = Utilities.newBlob(Utilities.base64Decode(x.data), x.type, (i + 1) + '_' + String(x.name || 'file').replace(/[^\w.\- ]/g, '').slice(0, 60));
+    links.push(f.createFile(blob).getUrl());
+  });
+  return links;
+}
+
+/* ---------- Enquiries ---------- */
+function enquiry_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  const ref = 'NJ' + Utilities.formatDate(new Date(), 'Asia/Kolkata', 'yyMMdd') + '-' + Math.floor(1000 + Math.random() * 9000);
+  const links = saveFiles_(ref, r.files);
+  append_('enquiries', { Time: now_(), Ref: ref, MemberID: m.MemberID, Name: String(r.name || m.Name).slice(0, 80), Phone: phone_(r.phone || m.Phone),
+    Area: String(r.area || '').slice(0, 80), Problem: String(r.problem || '').slice(0, 120), Details: String(r.details || '').slice(0, 5000),
+    BestTime: String(r.time || ''), Status: 'New', NoteToClient: '', Files: links.join('\n'), Updated: now_() });
+  if (NOTIFY_EMAIL) {
+    try { MailApp.sendEmail(NOTIFY_EMAIL, (String(r.area) === 'URGENT FILING' ? '🚨 URGENT FILING ' : 'Nyaya Jyothi – new enquiry ') + ref + ' – ' + r.problem,
+      r.details + (links.length ? '\n\nDocuments:\n' + links.join('\n') : '')); } catch (e) { console.error(e); }
+  }
+  return { ok: true, id: ref };
+}
+function addFiles_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  const e = rows_('enquiries').find(x => x.Ref === r.id && x.MemberID === m.MemberID);
+  if (!e) return fail_('Enquiry not found.');
+  const links = saveFiles_(r.id, r.files);
+  setCells_('enquiries', e._row, { Files: [e.Files, ...links].filter(String).join('\n'), Updated: now_() });
+  if (NOTIFY_EMAIL && links.length) { try { MailApp.sendEmail(NOTIFY_EMAIL, 'Nyaya Jyothi – more documents for ' + r.id, links.join('\n')); } catch (x) {} }
+  return { ok: true };
+}
+function my_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  const items = rows_('enquiries').filter(e => e.MemberID === m.MemberID).reverse()
+    .map(e => ({ id: e.Ref, time: String(e.Time), problem: e.Problem, status: e.Status || 'New', note: e.NoteToClient, files: String(e.Files || '').split('\n').filter(String).length }));
+  return { ok: true, items };
+}
+
+/* ---------- Advocate dashboard (password protected) ---------- */
+function isAdmin_(pw) { return ADMIN_PASSWORD !== 'CHANGE-THIS-PASSWORD' && String(pw) === ADMIN_PASSWORD; }
+function admin_(r) {
+  if (!isAdmin_(r.password)) { Utilities.sleep(1500); return fail_('Wrong password.'); }
+  const ms = rows_('members'), es = rows_('enquiries'), t = Date.now();
+  const startToday = new Date(Utilities.formatDate(new Date(), 'Asia/Kolkata', "yyyy-MM-dd'T'00:00:00+05:30")).getTime();
+  const stats = { members: ms.length, citizens: ms.filter(m => m.Type === 'Citizen').length,
+    today: ms.filter(m => Number(m.LastSeenMs) >= startToday).length, week: ms.filter(m => t - Number(m.LastSeenMs) < 7 * 864e5).length,
+    enquiries: es.length, fresh: es.filter(e => (e.Status || 'New') === 'New').length };
+  stats.advocates = ms.filter(m => m.Type === 'Advocate').length; stats.cases = Math.max(0, sheet_('cases').getLastRow() - 1); stats.ai = Math.max(0, sheet_('ai').getLastRow() - 1);
+  const users = ms.sort((a, b) => Number(b.LastSeenMs) - Number(a.LastSeenMs)).map(m => ({ time: String(m.Joined), name: m.Name, phone: phone_(m.Phone),
+    district: m.District, type: m.Type || '', email: m.Email || '', enrol: m.Enrolment || '', lang: ({ en: 'English', ta: 'Tamil', hi: 'Hindi' })[m.Language] || '', state: m.State || '', court: m.Court || '',
+    last: String(m.LastSeen || ''), visits: m.Visits || 0 }));
+  const enquiries = es.reverse().slice(0, 500).map(e => ({ id: e.Ref, time: String(e.Time), name: e.Name, phone: phone_(e.Phone), area: e.Area, problem: e.Problem,
+    details: e.Details, status: e.Status || 'New', note: e.NoteToClient, files: String(e.Files || '').split('\n').filter(String) }));
+  return { ok: true, stats, users, enquiries, activity: activity_(), usage: usage_(), settings: settings_() };
+}
+function setStatus_(r) {
+  if (!isAdmin_(r.password)) return fail_('Wrong password.');
+  const e = rows_('enquiries').find(x => x.Ref === r.id);
+  if (!e) return fail_('Enquiry not found.');
+  setCells_('enquiries', e._row, { Status: String(r.status).slice(0, 30), NoteToClient: String(r.note || '').slice(0, 300), Updated: now_() });
+  return { ok: true };
+}
+
+function resetPin_(r) {
+  if (!isAdmin_(r.password)) return fail_('Wrong password.');
+  if (!/^\d{4}$/.test(String(r.pin))) return fail_('PIN must be 4 digits.');
+  const m = rows_('members').find(x => phone_(x.Phone) === phone_(r.phone)); if (!m) return fail_('Member not found.');
+  const salt = Utilities.getUuid(); setCells_('members', m._row, { PinHash: hash_(r.pin, salt), Salt: salt, Fails: 0, LockUntil: 0, Token: '' });
+  return { ok: true };
+}
+/* Forgot PIN: mobile number + date of birth given at sign-up, then a new PIN */
+function forgotPin_(r) {
+  const phone = phone_(r.phone), dob = String(r.dob || '').trim();
+  if (!/^[6-9]\d{9}$/.test(phone)) return fail_('Please enter a valid 10-digit mobile number.');
+  if (!/^\d{4}$/.test(String(r.pin))) return fail_('PIN must be 4 digits.');
+  const m = rows_('members').find(x => phone_(x.Phone) === phone);
+  if (!m) return fail_('No account found for this mobile number. Please check the number or create a new account.');
+  if (Number(m.LockUntil) > Date.now()) return fail_('Too many wrong attempts. Please try after 15 minutes, or call the office.');
+  if (!m.DobHash) return fail_('No date of birth is on record for this number. Please call the office to reset your PIN.');
+  if (hash_('dob:' + dob, m.DobSalt) !== m.DobHash) {
+    const f = Number(m.Fails || 0) + 1;
+    setCells_('members', m._row, { Fails: f >= 5 ? 0 : f, LockUntil: f >= 5 ? Date.now() + 15 * 60000 : 0 });
+    return fail_('The date of birth does not match our record for this number.');
+  }
+  const salt = Utilities.getUuid();
+  setCells_('members', m._row, { PinHash: hash_(r.pin, salt), Salt: salt, Fails: 0, LockUntil: 0 });
+  append_('activity', { Time: now_(), TimeMs: Date.now(), Phone: phone, Name: m.Name, Type: 'pin_reset', Detail: 'Forgot PIN' });
+  return login_(phone, 'PIN reset');
+}
+/* Change PIN: present PIN + new PIN (works from any phone) */
+function changePin_(r) {
+  const m = member_(r.token); if (!m) return fail_('Please sign in again.', 'auth');
+  if (!/^\d{4}$/.test(String(r.pin))) return fail_('PIN must be 4 digits.');
+  if (hash_(r.oldPin, m.Salt) !== m.PinHash) return fail_('The present PIN is wrong.');
+  const salt = Utilities.getUuid();
+  setCells_('members', m._row, { PinHash: hash_(r.pin, salt), Salt: salt, Fails: 0, LockUntil: 0 });
+  append_('activity', { Time: now_(), TimeMs: Date.now(), Phone: phone_(m.Phone), Name: m.Name, Type: 'pin_change', Detail: '' });
+  return { ok: true };
+}
+function memberDetail_(r) {
+  if (!isAdmin_(r.password)) return fail_('Wrong password.');
+  const ph = phone_(r.phone), sh = sheet_('activity'), n = sh.getLastRow() - 1;
+  const v = n > 0 ? sh.getRange(2, 1, n, 6).getValues() : [];
+  const events = v.filter(x => phone_(x[2]) === ph).slice(-1000).reverse().map(x => ({ time: String(x[0]), type: x[4], detail: x[5] }));
+  const enq = rows_('enquiries').filter(e => phone_(e.Phone) === ph).reverse().map(e => ({ id: e.Ref, time: String(e.Time), problem: e.Problem, status: e.Status }));
+  const cs = rows_('cases').filter(c => phone_(c.Phone) === ph).map(c => ({ no: c.CaseNo, court: c.Court, next: String(c.NextDate), stage: c.Stage }));
+  return { ok: true, events, enquiries: enq, cases: cs };
+}
+
+/* ---------- App settings you can change from the dashboard ---------- */
+const SETTING_KEYS = ['PHONE', 'PHONE_WA', 'EMAIL', 'ADDRESS', 'SHARE_URL', 'NOTICE_en', 'NOTICE_ta', 'NOTICE_hi', 'AI_ON'];
+function settings_() { const o = {}; rows_('settings').forEach(r => { if (SETTING_KEYS.indexOf(r.Key) >= 0) o[r.Key] = String(r.Value); }); return o; }
+function saveSettings_(r) {
+  if (!isAdmin_(r.password)) return fail_('Wrong password.');
+  const cur = rows_('settings'), s = r.settings || {};
+  SETTING_KEYS.forEach(k => { if (!(k in s)) return; const v = String(s[k]).slice(0, 500), ex = cur.find(x => x.Key === k);
+    if (ex) setCells_('settings', ex._row, { Value: v, Updated: now_() }); else append_('settings', { Key: k, Value: v, Updated: now_() }); });
+  return { ok: true, settings: settings_() };
+}
+function usage_() {
+  const sh = sheet_('activity'), n = sh.getLastRow() - 1, days = [];
+  const v = n > 0 ? sh.getRange(Math.max(2, sh.getLastRow() - 20000 + 1), 1, Math.min(n, 20000), 6).getValues() : [];
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 864e5), key = Utilities.formatDate(d, 'Asia/Kolkata', 'dd.MM.yyyy');
+    const rows = v.filter(r => String(r[0]).indexOf(key) === 0);
+    days.push({ day: key.slice(0, 5), active: new Set(rows.map(r => String(r[2]))).size, signups: rows.filter(r => r[4] === 'signup').length,
+      searches: rows.filter(r => r[4] === 'search').length, ai: rows.filter(r => r[4] === 'ai_question').length });
+  }
+  const types = {}; rows_('members').forEach(m => { const k = m.Type || 'Not set'; types[k] = (types[k] || 0) + 1; });
+  const dist = {}; rows_('members').forEach(m => { const k = m.District || '—'; dist[k] = (dist[k] || 0) + 1; });
+  return { days, types, districts: Object.keys(dist).map(k => [k, dist[k]]).sort((a, b) => b[1] - a[1]).slice(0, 12) };
+}
+
+/* Run once from the editor: creates the tabs and asks for Drive / Mail permission. */
+function setup() {
+  Object.keys(SH).forEach(sheet_);
+  Object.keys(SH).forEach(n => { const sh = sheet_(n); sh.getRange(1, 1, 1, SH[n].length).setValues([SH[n]]).setFontWeight('bold').setBackground('#f6e7c8'); }); folder_('test').setTrashed(true);
+  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'dailyReminders').forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('dailyReminders').timeBased().atHour(7).everyDays(1).inTimezone('Asia/Kolkata').create();
+}

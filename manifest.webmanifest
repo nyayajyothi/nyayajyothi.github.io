@@ -1,12 +1,12 @@
 {
- "name": "Nyaya Jyothi \u2013 Legal Help",
- "short_name": "Nyaya Jyothi",
+ "name": "NJ Legal Solutions",
+ "short_name": "NJ Legal",
  "start_url": "./",
  "scope": "./",
  "display": "standalone",
  "background_color": "#fff8ec",
  "theme_color": "#b8430a",
- "description": "Simple legal help in English, Tamil and Hindi by A. Neeraj, Advocate, High Court of Madras.",
+ "description": "Legal information, hearing guide, case diary and NJ AI in English, Tamil and Hindi.",
  "icons": [
   {
    "src": "icon-192.png",
